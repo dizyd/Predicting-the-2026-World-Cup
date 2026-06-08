@@ -1,0 +1,663 @@
+---
+title: "Predicting the 2026 World Cup: A Bayesian Approach"
+subtitle: "Using qualifying matches and FIFA player stats to forecast the group stages"
+uthor: "David Izydorczyk"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    code-fold: true
+    code-copy: true
+    code-tools: true
+    df-print: paged
+    number-sections: false
+    toc: true
+    toc-location: right
+    fig-height: 4
+    fig-width:  9
+    fig-cap-location: top
+    tab-cap-location: top
+    embed-resources: true
+    grid:
+      margin-width: 350px
+execute:
+  warning: false
+  messages: false
+  echo: true
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction                            
+
+The 2026 FIFA World Cup is starting soon, with a historical maximum of 48 teams and spanning across three countries: the US, Canada, and Mexico. But with more teams comes more unpredictability. Who will dominate the group stages? With this project, I want to see if I can use data to forecast the outcomes of these group stage matchups (and learn more about scraping data).
+
+In this Quarto document, I will build a statistical model to predict the results of the 2026 World Cup group stages. To do this, I will rely on two main data sources:
+
+1. **Qualifying Matches Data:** Historical match results to understand team momentum and scoring abilities.
+
+2. **FIFA Video Game Stats:** The average overall player scores and ages for each country, giving us a proxy for the baseline talent level of each squad.
+
+Let's dive into the data, explore the global football landscape, and build a Bayesian predictive mode
+
+
+```{r setup}
+#| code-summary: "Load packages & ggplot theme"
+#| cache: false
+
+# Packages
+library(tidyverse)
+library(maps)
+library(mapdata)
+library(viridis)
+library(patchwork)
+library(countrycode)
+library(ggthemes)
+library(ggrepel)
+library(tidyr)
+library(extrafont)
+library(correlation)
+library(psych)
+library(papaja)
+library(kableExtra)
+library(rstan)
+library(tidybayes)
+library(bayesplot)
+library(brms)
+library(kableExtra)
+library(latex2exp)
+
+source("plot_settings.R")
+```
+
+```{r data}
+#| code-summary: "Load & prepare data"
+
+df_quali0 <- read_csv("../Data/wm2026_quali_games.csv")
+df_stats  <- read_csv2("../Data/country_stats.csv") 
+
+df_quali  <- df_quali0 |>
+                filter(Score != "Cancelled") |> 
+                select(region = Region, team_home = Home, team_away = Away, Score, -Date,) |> 
+                mutate(region     = str_split_i(region,"_",1),
+                       goals_home = str_split_i(Score, "–", 1) |> parse_number(),
+                       goals_away = str_split_i(Score, "–", 2) |> parse_number()) |> 
+                select(-Score)
+
+
+```
+
+```{r helper}
+#| code-summary: "Helper functions"
+
+modus <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+```
+
+
+# Exploring the Global Football Landscape 
+
+Now I want to visualize this geographically. By projecting the goals scored and received onto a world map, we can quickly spot which regions boast the most offensive firepower and which ones struggle defensively.
+
+```{r exp_goals}
+#| code-summary: "Get goals scored and received"
+
+goals <- df_quali |> 
+          mutate(match = row_number()) |> 
+          pivot_longer(cols      = starts_with("team"),
+                       names_to  = "side",
+                       values_to = "team") |> 
+          mutate(scored   = if_else(side == "goals_home", goals_home, goals_away),
+                 received = if_else(side == "goals_home", goals_away, goals_home)) |> 
+          group_by(team, region) |> 
+          summarise(scored   = sum(scored),
+                    received = sum(received),
+                    .groups  = "drop")
+
+goals
+
+```
+
+Now I want to make a world map and then color each country by the number of goals scored/received using the `map` package.
+
+
+::: {.callout-note collapse="true" title="Process notes (for later me):"}
+
+Before we can do the actual plots, I first have to load the world map data and make sure I can match my country names to the ones in the `map` package.
+
+```{r}
+world <- map_data("world")
+head(world)
+```
+
+This world data.frame has the following variables: `long` for longitude, `lat` for latitude, `group` tells which adjacent points to connect, `order` refers to the sequence by which the points should be connected, and `region` and `subregion` annotate the area surrounded by a set of points. We can use this information to plot the world using ggplot:
+
+```{r}
+ggplot(data = world, aes(x=long, y = lat, group = group)) +
+  geom_polygon(color="black",fill="lightgrey")  +
+  coord_fixed(1.3) + theme_map() # looks better
+```
+
+To color each country by the number of goals, I join the world and the goals data frames. This requires some manual alignment, as football "countries" (like Wales, Scotland, or England) differ from sovereign nation-states.
+
+```{r}
+world <- world |> 
+            mutate(team = case_when(subregion == "Wales" ~ "Wales",
+                                    subregion == "Northern Ireland" ~ "Northern Ireland",
+                                    subregion == "Scotland" ~ "Scotland",
+                                    subregion == "Great Britain" ~ "England",
+                                    subregion == "Hong Kong" ~ "Hong Kong",
+                                    region    == "Antigua" ~ "Antigua and Barbuda",
+                                    region    == "Barbuda" ~ "Antigua and Barbuda",
+                                    subregion == " British" ~ "British Virgin Islands",
+                                    subregion == " US" ~ "U.S. Virgin Islands",
+                                    region    == "Republic of Congo" ~ "Congo",
+                                    region    == "Democratic Republic of the Congo" ~ "DR Congo",
+                                    region    == "Curacao" ~ "Curaçao",
+                                    region    == "Saint Kitts" ~ "Saint Kitts and Nevis",
+                                    region    == "Nevis" ~ "Saint Kitts and Nevis",
+                                    region    == "Saint Vincent" ~ "Saint Vincent and the Grenadines",
+                                    region    == "Grenadines" ~ "Saint Vincent and the Grenadines",
+                                    region    == "Sao Tome and Principe" ~ "São Tomé and Príncipe",
+                                    subregion == "Tahiti" ~ "Tahiti",
+                                    region    == "Trinidad" ~ "Trinidad and Tobago",
+                                    region    == "Tobago" ~ "Trinidad and Tobago",
+                                    subregion == "Macao" ~ "Macau",
+                                    region    == "Ireland" ~ "Republic of Ireland",
+                                    region    == "Taiwan" ~ "Chinese Taipei",
+                                    region    == "USA" ~ "United States",
+                                    TRUE ~ region))
+
+goals_world <- left_join(goals,world,by="team") |>  
+                      select(region = team, scored, received, long, lat, group, order)
+
+# checks:
+# check if any countries do not have infos from world
+# goals_world |>  filter(is.na(long)) |>  pull(region) |>  unique()
+
+#! Eswatini, Gibraltar not in world
+```
+
+:::
+
+
+```{r worldgoals}
+#| code-summary: "Plot goals around the world"
+#| fig-height: 6
+#| fig-width:  15
+#| fig-align: center
+#| column: page
+#| label: fig-goalsworld
+
+
+p1 <- ggplot(data = goals_world, aes(x=long, y = lat, group = group)) +
+        geom_polygon(aes(fill=scored), color="black",linewidth = 0.5) + 
+        scale_fill_viridis(limits = c(0, 92)) +
+        coord_fixed(1.3) +
+        labs(title = "Goals Scored", fill = "# goals") + theme_map(base_family = "Jost") +
+        theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+  
+
+
+p2 <- ggplot(data = goals_world, aes(x=long, y = lat, group = group)) +
+        geom_polygon(aes(fill=received), color="black",size = 0.5) + 
+        scale_fill_viridis(limits = c(0, 92)) +
+        coord_fixed(1.3) +
+        labs(title = "Goals Received", fill = "# goals") + theme_map(base_family = "Jost") +
+        theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+
+p1 + p2  +  plot_layout(guides = 'collect')
+```
+
+It seems there are regional differences in how many goals are scored versus received. Let's look at the numbers directly to see the correlation. Do teams that score a lot also concede a lot, or is a strong offense usually paired with a strong defense?
+
+```{r}
+res_r     <- cor.test(goals$received,goals$scored) |> apa_print()
+res_des_s <- describe(goals$scored)
+res_des_r <- describe(goals$received)
+```
+
+There is a substantial positive correlation between the number of goals scored and the number of goals received (`r res_r$full_result`). On average, countries scored  `r print_num(res_des_s$mean)` (*SD* = `r print_num(res_des_s$sd)`) goals and received `r print_num(res_des_r$mean)` (*SD* = `r print_num(res_des_r$sd)`) goals.  @tbl-scoredreceived shows the countries with the most scored and received goals.
+
+The tables @tbl-scoredreceived below show the extremes: the top 5 and bottom 5 countries in terms of offensive output and defensive vulnerabilities.
+
+```{r}
+#| code-summary: "Make tables"
+#| label: tbl-scoredreceived
+#| tbl-cap: "Countries with most and least goals scored and received"
+#| tbl-subcap: 
+#| - "Scored"
+#| - "Received"
+#| layout-ncol: 2
+
+goals |> 
+  arrange(desc(scored)) |> 
+  slice(c(1:5, (n() - 4):n()))  |> 
+  kbl(col.names = c("Country", "Region", "Scored", "Received"), align = "c") |> 
+  kable_paper(c("hover")) 
+
+
+goals |> 
+  arrange(desc(received)) |> 
+  slice(c(1:5, (n() - 4):n()))  |> 
+  kbl(col.names = c("Country", "Region", "Scored", "Received"), align = "c") |> 
+  kable_paper(c("hover")) 
+
+```
+
+Lets also visualize this relationship and the distribution of goals in the following scatterplot and histograms (see Fig. @fig-goalsdist).
+
+```{r}
+#| code-summary: "Plots"
+#| fig-height: 6
+#| fig-width:  15
+#| fig-align: center
+#| column: page
+#| label: fig-goalsdist
+
+p1 <- ggplot(goals,aes(x = scored, y = received)) +
+        geom_point(shape = 21, fill = "lightgrey",size = 2) +
+        geom_smooth(method = "lm", color = clrs[2]) +
+        geom_label_repel(aes(label = team),
+                         box.padding   = 0.35, 
+                         point.padding = 0.5,
+                         segment.color = 'grey50',
+                         max.overlaps  = 25) +
+        theme_nice() +
+        labs(,x = "# scored goals", y="# received goals",
+             title = "Relationship of goals scored and received")
+
+
+p2 <- goals |> 
+        pivot_longer(cols = scored:received) |> 
+        ggplot(aes(x = value)) + 
+          geom_histogram(fill = clrs[2]) +
+          facet_grid(.~name) +
+          labs(x = "# goals", y="count", title = "Distribution of goals ...") +
+          scale_x_continuous(expand = c(0, 0), limits = c(0, 95)) + 
+          scale_y_continuous(expand = c(0, 0), limits = c(0, 40)) +
+          theme_nice()
+
+
+p1 + p2
+```
+
+
+# Incorporating FIFA Player Stats         
+
+Match history is great, but team rosters change. To ground the later predictions in current team quality, I used data from EA Sports FC / FIFA video games, looking at the average overall player rating and the average age of the national squad.
+
+```{r worldstats}
+#| code-summary: "Plot stats around the world"
+#| fig-height: 6
+#| fig-width:  15
+#| fig-align: center
+#| column: page
+#| label: fig-statsworld
+
+
+stats_world <- left_join(df_stats |> rename(team = country),world,by="team") |>  
+                      select(region = team, mean_overall, mean_age,
+                             long, lat, group, order)
+
+# stats_world |>  filter(is.na(long)) |>  pull(region) |>  unique()
+
+p1 <- ggplot(data = stats_world, aes(x=long, y = lat, group = group)) +
+        geom_polygon(aes(fill=mean_overall), color="black",linewidth = 0.5) + 
+        scale_fill_viridis() +
+        coord_fixed(1.3) +
+        labs(title = "Avg. Overall Score", fill = "Avg. Score") + theme_map(base_family = "Jost") +
+        theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+  
+
+p2 <- ggplot(data = stats_world, aes(x=long, y = lat, group = group)) +
+        geom_polygon(aes(fill=mean_age), color="black",size = 0.5) + 
+        scale_fill_viridis() +
+        coord_fixed(1.3) +
+        labs(title = "Avg. Age", fill = "Avg. age") + theme_map(base_family = "Jost") +
+        theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+
+p1 + p2
+```
+
+The countries with the highest average player scores come heavily from Europe and South America—the traditional powerhouses of football. Meanwhile, countries in Asia appear to have slightly older squads on average. 
+
+How well do these video game stats translate to real-world performance? Let's check the correlation map.
+
+```{r}
+#| code-summary: "Plot"
+#| fig-height: 6
+#| fig-width:  9
+#| fig-align: center
+#| column: page
+#| label: fig-relationshipstatsgoals
+
+
+goals |> 
+  left_join(df_stats |> rename(team = country), by = "team") |> 
+  select(scored, received, starts_with("mean")) |> 
+  correlation() |> 
+  summary() |> 
+  plot() +
+  scale_fill_viridis_c() +
+  theme_nice()
+ 
+```
+
+Unsurprisingly, a higher `mean_overall` score correlates strongly with scoring more goals and conceding fewer. This confirms that our FIFA stats are a robust feature to include in our predictive model.
+
+
+
+
+
+
+
+# Modeling the Matches                    
+
+To predict match outcomes, I use a Bayesian Poisson regression model using Stan. Football goals are discrete events (counts), making the Poisson distribution a natural choice.
+
+My model assumes the number of goals scored by Team A against Team B is influenced by a baseline scoring rate ($\mu$), an intrinsic "strength" parameter for the attacking team $t$ ($\lambda_t$), and the difference in their average FIFA player scores ($b_1$):
+
+$$ \text{Goals}_t\sim \text{Poisson}(\exp(\mu + \lambda_t + b_1 \cdot (\text{score}_A - \text{score}_B))) $$
+
+First, we prepare our data, making sure to handle small nations without FIFA data by imputing a conservative baseline score.
+
+
+```{r prepare}
+#| code-summary: "Prepare data of qualiyfing matches"
+
+temp <- df_stats |>
+          select(ID, team = country, mean_overall) |> 
+          filter(!team %in% c("United States", "Canada", "Mexico", "Eritrea")) |> # do not onclude USA, Canada, Mexico, and Eritrea because there are no games
+          mutate(ID = 1:length(team)) # redefine ID because Eritrea (61) is now missing
+  
+
+# Check for missings 
+  # temp$mean_overall |> is.na() |> sum() -> 49
+  # temp |> filter(is.na(mean_overall))
+# It is mostly very small nations, where there is no player score data available. I will
+# impute the smalles value of the other countries (= 51) for these missing values
+temp[which(temp$mean_overall |> is.na()), "mean_overall"] <- 51 
+
+model_data <- df_quali %>% 
+                add_column("game" = 1:nrow(.),.before = "region") |> 
+                left_join(temp,by = c("team_home" = "team")) |> 
+                left_join(temp,by = c("team_away" = "team"),suffix = c("_home", "_away")) |> 
+                na.omit() # remove 3 matches where I dont have the countries anywhere else
+
+stan_data <- list(N_teams   = length(unique(model_data$team_home)),
+                  N_matches = length(model_data$game),
+                  goals_A   = model_data$goals_home,
+                  goals_B   = model_data$goals_away,
+                  team_A    = model_data$ID_home,
+                  team_B    = model_data$ID_away,
+                  score_A   = model_data$mean_overall_home |> scale() %>% .[,1],
+                  score_B   = model_data$mean_overall_away |> scale() %>% .[,1])
+
+```
+
+Now we fit the model via Markov Chain Monte Carlo (MCMC) sampling.
+
+```{r fit}
+#| code-summary: "Fit Model"
+#| cache: true
+#| message: false
+#| warning: false
+#| results: hide
+#| output: false
+
+fit <- stan(file       = "../Model/football.stan", 
+            data       = stan_data, 
+            chains     = 2,         
+            warmup     = 2000,      
+            iter       = 4000,     
+            refresh    = 1,        
+            thin       = 4,
+            verbose    = FALSE,
+            refresh    = 0)
+```
+
+To ensure our model converged correctly, we check the MCMC traces. Healthy traces look like "hairy caterpillars," meaning the chains have mixed well.
+
+```{r traces}
+#| code-summary: "Check traces"
+#| fig-height: 4
+#| fig-width:  10
+#| fig-align: center
+#| column: page
+#| label: fig-traces
+
+mcmc_trace(fit,
+            pars = vars("b1", "mu", "lambda0[1]"),
+            facet_args = list(nrow =1, labeller = label_parsed)) +
+           theme_nice() +
+           scale_color_manual(values=clrs[c(3,4)])
+
+```
+
+
+# Predicting the 2026 World Cup           
+
+With the model trained, it's time to simulate the tournament! I use the offical tournament plan, where the teams are spread across 12 groups. Because the host nations (USA, Canada, Mexico) auto-qualified (and I don't have any data on them) I exclude them for now.  
+
+```{r preparePredict}
+#| code-summary: "Prepare data of WM 2026 matches"
+
+# Define groups
+world_cup_teams <- tibble(
+  group = rep(LETTERS[1:12], each = 4),
+  team = c(
+    "Mexico", "South Africa", "South Korea", "Czech Republic",  # Group A
+    "Canada", "Bosnia and Herzegovina", "Qatar", "Switzerland", # Group B
+    "Brazil", "Morocco", "Haiti", "Scotland",                   # Group C
+    "USA", "Paraguay", "Australia", "Turkey",                   # Group D
+    "Germany", "Curaçao", "Ivory Coast", "Ecuador",             # Group E
+    "Netherlands", "Japan", "Sweden", "Tunisia",                # Group F
+    "Belgium", "Egypt", "Iran", "New Zealand",                  # Group G
+    "Spain", "Cape Verde", "Saudi Arabia", "Uruguay",           # Group H
+    "France", "Senegal", "Iraq", "Norway",                      # Group I
+    "Argentina", "Algeria", "Austria", "Jordan",                # Group J
+    "Portugal", "DR Congo", "Uzbekistan", "Colombia",           # Group K
+    "England", "Croatia", "Ghana", "Panama"                     # Group L
+  )
+)
+
+# Generate matches
+WM_matches <- world_cup_teams |> 
+                inner_join(world_cup_teams, by = "group", suffix = c("_A", "_B")) |> 
+                filter(team_A < team_B) |> 
+                filter(!team_A %in% c("USA", "Canada", "Mexico"),
+                       !team_B %in% c("USA", "Canada", "Mexico"))
+
+
+# Add index and score
+WM_matches <- WM_matches |> 
+                left_join(temp, by = c("team_A" = "team")) |> 
+                left_join(temp, by = c("team_B" = "team"),
+                          suffix = c("_A", "_B")) |> 
+                mutate(mean_overall_A = mean_overall_A |> scale() %>% .[,1],
+                       mean_overall_B = mean_overall_B |> scale() %>% .[,1])
+
+```
+
+The true power of Bayesian modeling is that one doesn't just get a single predicted score; we get a *distribution* of possible outcomes. By extracting the posterior parameters, I can now simulate each match thousands of times to calculate the precise probabilities of a win, loss, or draw.
+
+```{r extractPost}
+#| code-summary: "Extract posterior parameters"
+
+post_lambda0 <- fit |> spread_draws(lambda0[ID])
+post_pars    <- fit |> spread_draws(b1,mu)
+
+```
+
+The following code snippet is the heart of your predictive model. While the Stan model calculates the parameters, this specific loop executes the Monte Carlo simulation—it takes the theoretical probabilities and plays out thousands of virtual matches to generate concrete forecasts. The code is built around a nested structure: an outer loop that iterates through every scheduled match, and an inner loop that iterates through every single posterior sample from the Bayesian model.
+
+```{r makePreds}
+#| code-summary: "Make predictions"
+#| cache: true
+
+samples   <- nrow(post_pars)
+pred      <- list()
+pred_sum  <- list()
+
+
+for(match in 1:nrow(WM_matches)){
+  
+  team_A  <- WM_matches$ID_A[match]
+  team_B  <- WM_matches$ID_B[match]
+  
+  score_A <- WM_matches$mean_overall_A[match]
+  score_B <- WM_matches$mean_overall_B[match]
+  
+  
+  res_m <- data.frame("goals_A" = rep(0,samples),
+                      "goals_B" = rep(0,samples))
+  
+  for(sample in 1:samples){
+    
+    mu_i        <- post_pars$mu[sample]
+    b1_i        <- post_pars$b1[sample]
+    lambda0_A_i <- post_lambda0 |> filter(ID == team_A) |> pull(lambda0) %>% .[sample]
+    lambda0_B_i <- post_lambda0 |> filter(ID == team_B) |> pull(lambda0) %>% .[sample]
+  
+    res_m$goals_A[sample] = rpois(1,lambda = exp(mu_i + lambda0_A_i+ b1_i * (score_A-score_B)))
+    res_m$goals_B[sample] = rpois(1,lambda = exp(mu_i + lambda0_B_i+ b1_i * (score_B-score_A)))
+    
+  }
+  
+  
+  pred[[match]] <- res_m
+  
+  pred_sum[[match]] <-   data.frame("team_A"  = team_A,
+                                    "team_B"  = team_B,
+                                    "md_g_A"  = modus(res_m$goals_A),
+                                    "m_g_A"   = median(res_m$goals_A),
+                                    "sd_g_A"  = sd(res_m$goals_A),
+                                    "md_g_B"  = modus(res_m$goals_B),
+                                    "m_g_B"   = median(res_m$goals_B),
+                                    "sd_g_B"  = sd(res_m$goals_B),
+                                    "p_win_A" = mean(res_m$goals_A > res_m$goals_B),
+                                    "p_win_B" = mean(res_m$goals_B > res_m$goals_A))
+  
+
+}
+```
+
+The main resulting data.frame `res` looks like this:
+
+```{r}
+res <- pred_sum |>
+        bind_rows() |>
+        mutate(p_tie = 1-(p_win_A+p_win_B)) |> 
+        left_join(temp |> select(ID,team), by = c("team_A" = "ID")) |> 
+        left_join(temp |> select(ID,team), by = c("team_B" = "ID"),
+                          suffix = c("_A", "_B")) 
+res 
+```
+
+The following Fig. @fig-lambdas shows the random-intercepts (i.e., the $\lambda0_t$) of each team. Here one can clearly see, that because the qualifying games are within a certain region, the $\lambda_t$ parameter is only a biased measure of actual team strength (e.g., New Zealand > France).
+
+```{r plotLambdas}
+#| code-summary: "Plot inherent team offensive strength"
+#| fig-height: 15
+#| fig-width:  8
+#| fig-align: center
+#| label: fig-lambdas
+
+fit |>
+  spread_draws(lambda0[ID]) |>
+  left_join(temp |> select(ID, team), by = "ID") |>
+  ggplot(aes(x = lambda0, y = fct_reorder(team, lambda0))) +
+  stat_halfeye(fill = clrs[2], alpha = 0.7, point_interval = median_qi, .width = c(0.8, 0.95)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  theme_nice() +
+  labs(
+    title = "Inherent Offensive Strength by Country",
+    x = TeX("$\\lambda_t$"),
+    y = NULL
+  ) +
+  theme(axis.text.y = element_text(size = 9)) # Adjust text size for readability
+```
+
+Before looking at the final table, let`s visualize the probability density of goals for three specific matchups (two for the German team), to see if they make sense.
+
+```{r checkPreds}
+#| code-summary: "Visualize specific match predictions"
+#| fig-height: 4
+#| fig-width:  12
+#| fig-align: center
+#| column: page
+#| label: fig-preds
+
+p1 <- pred[[16]] |> 
+        pivot_longer(cols=c(goals_A,goals_B)) |> 
+        group_by(name, value) |>  
+        summarize(p = n()/samples) |> 
+        mutate(team = ifelse(name=="goals_A","Germany","Ivory Coast")) |> 
+        ggplot(aes(x = value, y = p, color=team,group=team)) +
+          geom_point(size=2)+
+          geom_line(lwd=1) +
+          scale_color_manual(values=clrs[c(3,4)]) +
+          theme_nice() +
+          labs(x = "Goals",
+               y = "Posterior Probability",
+               color = "Teams:")
+
+
+p2 <- pred[[34]] |> 
+        pivot_longer(cols=c(goals_A,goals_B)) |> 
+        group_by(name, value) |> 
+        summarize(p = n()/samples) |> 
+        mutate(team = ifelse(name=="goals_A","Spain","Uruguay")) |> 
+        ggplot(aes(x = value, y = p, color=team,group=team)) +
+          geom_point(size=2)+
+          geom_line(lwd=1) +
+          scale_color_manual(values=clrs[c(1,5)]) +
+          theme_nice() +
+          labs(x = "Goals",
+               y = "Posterior Probability",
+               color = "Teams:")
+
+
+p3 <- pred[[17]] |> 
+        pivot_longer(cols=c(goals_A,goals_B)) |> 
+        group_by(name, value) %>% 
+        summarize(p = n()/samples) |> 
+        mutate(team = ifelse(name=="goals_A","Curaçao","Germany")) |> 
+        ggplot(aes(x = value, y = p, color=team,group=team)) +
+          geom_point(size=2)+
+          geom_line(lwd=1) +
+          scale_color_manual(values=clrs[c(6,3)]) +
+          theme_nice() +
+          labs(x = "Goals",
+               y = "Posterior Probability",
+               color = "Teams:")
+
+p1 + p2 + p3
+```
+
+Finally, here are the full predictions for the group stages. The "Prediction Goals" represent the most likely scoreline (the mode), while the probabilities tell us how confident the model is in a win, loss, or tie.
+
+```{r mainPreds }
+#| code-summary: "Main predictions"
+
+
+res |> 
+  select(team_A_A,team_B_B,pred_goals_A = md_g_A, pred_goals_B = md_g_B,
+         p_win_A,p_win_B,p_tie) |> 
+  kable(format="markdown",
+        col.names = c("Team A", "Team B", "Prediction Goals A",
+                      "Prediction Goals B", "P(Win A)","P(Win B)", "P(Tie)"))
+```
+
+
+# Conclusion & Outlook                    
+
+This project was fun so far and the results look reasonable (based on my limited football knowledge). However, I guess that the historic qualification data alongside FIFA overall ratings allow only very limited predictions. Things I might add in the feauture (if I have time)
+
+- Try different Models (negative binomial vs. poisson)
+- Look in the literature how they did it
+- Use non-aggregated data for each country, by only including the specific ratings and scores for each individual player
